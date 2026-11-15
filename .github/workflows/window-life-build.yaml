@@ -1,0 +1,26 @@
+name: "Window Life: Build"
+
+on:
+    push:
+        branches: [feature/window-life]
+    workflow_dispatch:
+
+concurrency:
+    group: window-life-build-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        uses: ./.github/workflows/_shared-build.yaml
+        permissions:
+            contents: read
+        with:
+            ref: ${{ github.sha }}
+            repository: ${{ github.repository }}
+            run-cpp: true
+            run-shader-validation: true
+            run-shader-tests: false
+            run-cpp-tests: false
+            cache-artifacts: false
+            run-full-config-validation: true
+            cmake-preset: ALL
