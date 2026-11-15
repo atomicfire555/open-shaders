@@ -58,6 +58,7 @@
 #include "Features/VolumetricShadows.h"
 #include "Features/WaterEffects.h"
 #include "Features/WetnessEffects.h"
+#include "Features/WindowLife.h"
 #include "Features/Wind/Wind.h"
 #include "I18n/I18n.h"
 #include "Menu.h"
@@ -318,7 +319,9 @@ namespace
 			&globals::features::snowDeformation,
 			&globals::features::skin,
 			&globals::features::reverseZ,
-			&globals::features::postProcessing
+			&globals::features::postProcessing,
+			// Window Life installs its BSLightingShader geometry hook last so its per-draw SRV is the final bind.
+			&globals::features::windowLife
 		};
 		return features;
 	}

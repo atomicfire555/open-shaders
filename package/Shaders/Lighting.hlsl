@@ -1137,6 +1137,17 @@ float GetSnowParameterY(float texProjTmp, float alpha)
 #		endif
 #	endif
 
+// Window Life (ported from PIXL Renderer) is limited to static/object Lighting permutations.
+// A private PS structured SRV carries per-draw classification and optics; FeatureData b6 is untouched.
+#	if defined(WINDOW_LIFE) && !defined(LANDSCAPE) && !defined(LODLANDSCAPE) && !defined(LOD) && \
+		!defined(SKINNED) && !defined(SKIN) && !defined(HAIR) && !defined(EYE) && !defined(TREE_ANIM) && \
+		!defined(SPARKLE) && !defined(WORLD_MAP) && !defined(FUR_SHELLS)
+#		define WINDOW_LIFE_ACTIVE
+#		include "WindowLife/WindowLife.hlsli"
+// Glow-map luminance in the same space the emissive path below uses.
+#		define WINDOW_LIFE_GLOW_LUMA(UV) dot(max(Color::Glowmap(TexGlowSampler.Sample(SampGlowSampler, UV).xyz), 0.0f), float3(0.2126f, 0.7152f, 0.0722f))
+#	endif
+
 #	if defined(TERRAIN_BLENDING)
 #		include "TerrainBlending/TerrainBlending.hlsli"
 #	endif
@@ -1559,6 +1570,27 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 	float4 sampledCoatColor = PBRParams2;
 	float3 complexSpecular = 1.0;  // Declare complexSpecular at a higher scope so it's available throughout the shader (NEEDED FOR STOCH. FIX)
 
+#	if defined(WINDOW_LIFE_ACTIVE)
+	float windowLifeParallaxWeight = 1.0f;
+	float windowLifePrePane = -1.0f;
+#		if defined(EMAT)
+	// Decide pane ownership before any parallax changes the UV. A window atlas
+	// may share one draw with relief-bearing stone and wood.
+	const float2 windowLifeUvBeforeParallax = uv;
+	[branch] if (WindowLife::IsCandidate() && WindowLife::SuppressPaneParallax() && !SharedData::InMapMenu)
+	{
+		float4 paneColor = TexColorSampler.SampleBias(SampColorSampler, uv, SharedData::MipBias);
+		float4 paneNormal = TexNormalSampler.SampleBias(SampNormalSampler, uv, SharedData::MipBias);
+		float paneGlowLuma = 0.0f;
+		[branch] if (WindowLife::HasGameGlowTexture())
+			paneGlowLuma = WINDOW_LIFE_GLOW_LUMA(uv);
+		windowLifePrePane = WindowLife::PaneMask(paneColor.rgb, paneNormal, paneGlowLuma, uv);
+		windowLifeParallaxWeight = 1.0f - smoothstep(0.02f, 0.34f, windowLifePrePane);
+		parallaxShadowQuality *= windowLifeParallaxWeight;
+	}
+#		endif
+#	endif
+
 #	if defined(EMAT)
 #		if defined(PARALLAX) && (defined(SKINNED) || !defined(MODELSPACENORMALS))
 	if (SharedData::extendedMaterialSettings.EnableParallax) {
@@ -1669,6 +1701,16 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 	MESH_TV_SAMPLE(envMaskSample, TexEnvMaskSampler, SampEnvMaskSampler, uv);
 	float envMaskBase = envMaskSample.x;
 #	endif  // EMAT
+
+#	if defined(WINDOW_LIFE_ACTIVE) && defined(EMAT)
+	// Glass stays flat: pull any parallax displacement back on detected panes
+	// while frames and surrounding architecture keep their relief.
+	[branch] if (windowLifeParallaxWeight < 1.0f)
+	{
+		uv = lerp(windowLifeUvBeforeParallax, uv, windowLifeParallaxWeight);
+		pixelOffset *= windowLifeParallaxWeight;
+	}
+#	endif
 
 #	if defined(SNOW)
 	bool useSnowSpecular = true;
@@ -2332,6 +2374,60 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 
 #	if defined(MODELSPACENORMALS)
 	float3 vertexNormal = worldNormal;
+#	endif
+
+#	if defined(WINDOW_LIFE_ACTIVE)
+	// WINDOW LIFE: ARCHITECTURAL GLASS SURFACE
+	// Read the real glow map directly when the CPU classifier says one exists, so
+	// inhabited windows are found even when the Glowmap technique bit is absent.
+	float windowLifeGlowLuma = 0.0f;
+	[branch] if (WindowLife::HasGameGlowTexture())
+		windowLifeGlowLuma = WINDOW_LIFE_GLOW_LUMA(uv);
+	// Pane detection is calibrated on the raw diffuse texture, before any
+	// working-space conversion, so candidates re-read it unconverted.
+	float3 windowLifeBaseColor = rawBaseColor.rgb;
+	[branch] if (WindowLife::IsCandidate())
+		windowLifeBaseColor = TexColorSampler.SampleBias(SampColorSampler, diffuseUv, SharedData::MipBias).rgb;
+
+	// One coverage decision owns both the physical glass and its background.
+	float windowLifePane = 0.0f;
+	[branch] if (WindowLife::IsCandidate() && !SharedData::InMapMenu &&
+				 abs(viewPosition.z) < max(WindowLife::GetSurface0().y, WindowLife::GetSurface0().x + 1.0f))
+	{
+		[branch] if (windowLifeParallaxWeight <= 1.0e-4f &&
+					 windowLifePrePane >= 0.0f && all(abs(uv - uvOriginal) < 1.0e-7f))
+			windowLifePane = windowLifePrePane;
+		else
+			windowLifePane = WindowLife::PaneMask(windowLifeBaseColor, normalColor, windowLifeGlowLuma, uv);
+	}
+	WindowLife::SurfaceResult windowLifeSurface = WindowLife::EvaluateSurface(
+		input.WorldPosition.xyz,
+		viewDirection,
+		vertexNormal,
+		windowLifeBaseColor,
+		normalColor,
+		windowLifeGlowLuma,
+		uv,
+		viewPosition.z, windowLifePane);
+
+	[branch] if (windowLifeSurface.glassWeight > 1.0e-4f)
+	{
+		// Old architectural glass is much flatter than relief-mapped stone/wood. Retain a
+		// controlled fraction of authored normal detail, then add low-frequency waviness
+		// in the actual pane plane instead of embossing the diffuse texture.
+		float windowLifeNormalRetention = saturate(
+			windowLifeSurface.normalRetention * windowLifeSurface.glassWeight);
+		worldNormal = normalize(lerp(vertexNormal, worldNormal, windowLifeNormalRetention));
+		float3 windowLifeGlassN = normalize(vertexNormal);
+		float3 windowLifeGlassH = cross(float3(0.0f, 0.0f, 1.0f), windowLifeGlassN);
+		float windowLifeGlassHLen2 = dot(windowLifeGlassH, windowLifeGlassH);
+		windowLifeGlassH = windowLifeGlassHLen2 > 1.0e-5f ? windowLifeGlassH * rsqrt(windowLifeGlassHLen2) : float3(1.0f, 0.0f, 0.0f);
+		float3 windowLifeGlassV = normalize(cross(windowLifeGlassN, windowLifeGlassH));
+		worldNormal = normalize(
+			worldNormal +
+			windowLifeGlassH * windowLifeSurface.normalWarp.x +
+			windowLifeGlassV * windowLifeSurface.normalWarp.y);
+	}
 #	endif
 
 	float3 screenSpaceNormal = normalize(FrameBuffer::WorldToView(worldNormal, false, eyeIndex));
@@ -3353,6 +3449,16 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 	}
 #	endif
 
+#	if defined(WINDOW_LIFE_ACTIVE)
+	// WINDOW LIFE: GLASS MATERIAL RESPONSE
+	[branch] if (windowLifeSurface.glassWeight > 1.0e-4f)
+	{
+		float windowLifeGlassW = saturate(windowLifeSurface.glassWeight);
+		material.Roughness = lerp(material.Roughness, windowLifeSurface.roughness, windowLifeGlassW);
+		material.F0 = lerp(material.F0, max(material.F0, windowLifeSurface.f0.xxx), windowLifeGlassW);
+	}
+#	endif
+
 	float3 diffuseColor = 0.0.xxx;
 	float3 specularColor = 0.0.xxx;
 	float3 transmissionColor = 0.0.xxx;
@@ -3740,6 +3846,12 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 	{
 		// Input TexGlowSampler = linear by default, but Color::Glowmap returns in sRGB if LL disabled
 		float3 glowColor = Color::Glowmap(TexGlowSampler.Sample(SampGlowSampler, uv).xyz);
+#		if defined(WINDOW_LIFE_ACTIVE)
+		// The vanilla glowmap must not drown the recessed room/occupant layer once a
+		// trusted pane has been identified. Only the pane-covered portion is scaled.
+		if (WindowLife::IsCandidate() && windowLifePane > 1.0e-4f)
+			glowColor *= lerp(1.0f, 0.34f, saturate(windowLifePane));
+#		endif
 
 #		if defined(TRUE_PBR)
 		float3 emitVertexColor = Color::CompensateConvertedColor(Color::SrgbToLinear(input.Color.xyz));
@@ -3763,6 +3875,119 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 			emitColor *= glowColor;
 		}
 #		endif  // TRUE_PBR
+	}
+#	endif
+
+#	if defined(WINDOW_LIFE_ACTIVE)
+	// WINDOW LIFE: ROOM, OCCUPANTS AND TIER DEBUG
+#		if defined(EMAT)
+	const bool windowLifeSuppressAuthoredInterior = complexMaterialParallax;
+#		else
+	const bool windowLifeSuppressAuthoredInterior = false;
+#		endif
+	WindowLife::Result windowLife = WindowLife::Evaluate(
+		input.WorldPosition.xyz,
+		viewDirection,
+		vertexNormal,
+		windowLifeBaseColor,
+		normalColor,
+		windowLifeGlowLuma,
+		uv,
+		viewPosition.z,
+		windowLifeSurface.normalWarp,
+		windowLifeSuppressAuthoredInterior, windowLifePane);
+
+	// Authored recessed room back plane. Replace the source window's flat emissive
+	// fill with readable atlas detail while retaining a faint glass tint. The atlas
+	// is stored as sRGB and sampled linearly.
+	// The room and the debug views are kept apart from emitColor so they can be
+	// added after the albedo multiply below (see windowLifeRoomLight).
+	float3 windowLifeRoomLight = 0.0f.xxx;
+	float3 windowLifeDebugDirect = 0.0f.xxx;
+	float windowLifeAlbedoFlatten = 1.0f;
+	[branch] if (windowLife.roomColorWeight > 1.0e-4f)
+	{
+		float3 windowLifeRoomColor = max(windowLife.roomColor, 0.0f.xxx);
+		const bool windowLifeLinearRoom = ENABLE_LL;
+		windowLifeRoomColor = windowLifeLinearRoom ? Color::GamutTransform(windowLifeRoomColor) : Color::LinearToSrgb(windowLifeRoomColor);
+
+		float windowLifeEmitLuma = dot(max(emitColor, 0.0f.xxx), float3(0.2126f, 0.7152f, 0.0722f));
+		// RoomAtlas has a stable authored mean luminance. Exposure is derived from
+		// that mean, not from every sampled pixel, to keep furniture/light contrast.
+		float windowLifeRoomReferenceLuma = windowLifeLinearRoom ? 0.105f : 0.345f;
+		float windowLifeNightWeight = saturate((WindowLife::GetRuntime0().z - 0.12f) / 0.73f);
+		float windowLifeVisibilityFloor = lerp(
+			windowLifeLinearRoom ? 0.165f : 0.445f,
+			windowLifeLinearRoom ? 0.390f : 0.655f,
+			windowLifeNightWeight);
+		float windowLifeTargetLuma = max(
+			max(windowLifeEmitLuma * 0.92f, windowLifeGlowLuma * 0.76f + 0.105f),
+			windowLifeVisibilityFloor);
+		float windowLifeRoomExposure = clamp(windowLifeTargetLuma / windowLifeRoomReferenceLuma, 0.90f, 8.00f);
+		float3 windowLifeRoomExposed = windowLifeRoomColor * windowLifeRoomExposure;
+		float3 windowLifeRoomTarget = max(
+			windowLifeTargetLuma.xxx + (windowLifeRoomExposed - windowLifeTargetLuma.xxx) * 1.16f,
+			0.0f.xxx);
+		float windowLifeRoomCompositeWeight =
+			pow(saturate(windowLife.roomColorWeight * 1.34f), 0.72f) * 0.995f;
+		// Outdoor views retain authored day/night luminance, without the lit-room exposure boost.
+		if (SharedData::InInterior && WindowLife::GetFidelity1().w > 0.5f) {
+			windowLifeRoomTarget = windowLifeRoomColor;
+			windowLifeRoomCompositeWeight = min(windowLifeRoomCompositeWeight, 0.78f);
+		}
+		// Retain only a restrained stained-glass/weathering trace of the diffuse
+		// texture once an authored room is trustworthy.
+		diffuseColor *= lerp(1.0f, 0.08f, windowLifeRoomCompositeWeight);
+		emitColor *= 1.0f - windowLifeRoomCompositeWeight;
+		windowLifeRoomLight = windowLifeRoomTarget * windowLifeRoomCompositeWeight;
+
+		// The room is tinted by the pane's average glass colour rather than by
+		// every speck of frost or dirt in the window texture, so dense window
+		// textures no longer bury it. Overall brightness matches the original.
+		uint windowLifeDiffuseWidth;
+		uint windowLifeDiffuseHeight;
+		uint windowLifeDiffuseMips;
+		TexColorSampler.GetDimensions(0, windowLifeDiffuseWidth, windowLifeDiffuseHeight, windowLifeDiffuseMips);
+		float windowLifeAverageMip = min(5.0f, max((float)windowLifeDiffuseMips - 1.0f, 0.0f));
+		float3 windowLifeAverageGlass = TexColorSampler.SampleLevel(SampColorSampler, diffuseUv, windowLifeAverageMip).rgb;
+		float windowLifeHereLuma = dot(max(windowLifeBaseColor, 0.0f.xxx), float3(0.2126f, 0.7152f, 0.0722f));
+		float windowLifeAverageLuma = dot(max(windowLifeAverageGlass, 0.0f.xxx), float3(0.2126f, 0.7152f, 0.0722f));
+		windowLifeAlbedoFlatten = clamp(windowLifeAverageLuma / max(windowLifeHereLuma, 0.02f), 0.25f, 4.0f);
+	}
+
+	float windowLifeInteriorOcclusion = saturate(
+		windowLife.occlusion +
+		windowLife.curtainOcclusion +
+		windowLife.roomDepthOcclusion);
+	emitColor *= 1.0f - windowLifeInteriorOcclusion;
+	windowLifeRoomLight *= 1.0f - windowLifeInteriorOcclusion;
+	diffuseColor *= 1.0f - windowLifeInteriorOcclusion * 0.40f;
+
+	// Glass dirt influences transmission gently; it never extinguishes window glow.
+	[branch] if (windowLifeSurface.glassWeight > 1.0e-4f)
+	{
+		float windowLifeTransmission = lerp(1.0f, windowLifeSurface.transmission, windowLifeSurface.glassWeight * 0.30f);
+		emitColor *= windowLifeTransmission;
+		windowLifeRoomLight *= windowLifeTransmission;
+	}
+
+	if (WindowLife::GetRuntime1().x > 0.5f)
+	{
+		uint windowLifeDebugMode = WindowLife::GetDebugMode();
+		float3 windowLifeTierColor = windowLife.tier < 1.5f ? float3(0.10f, 0.38f, 1.00f)    // blue: glass only
+			: (windowLife.tier < 2.5f ? float3(1.00f, 0.63f, 0.08f)                         // amber: shallow interior
+									  : float3(0.10f, 0.90f, 0.32f));                       // green: full occupancy
+		float3 windowLifeDebugColor = windowLife.authoredLayoutState < 0.5f ? windowLifeTierColor
+			: (windowLife.authoredLayoutState < 1.5f ? float3(1.00f, 0.08f, 0.08f)          // red: authored fit failed
+			: (windowLife.authoredLayoutState < 2.5f ? float3(0.06f, 0.82f, 1.00f)          // cyan: room background fit
+													 : float3(0.10f, 0.90f, 0.32f)));       // green: occupant-safe fit
+		float windowLifeDebugWeight = saturate(windowLife.debugMask * 0.58f);
+		float3 windowLifeDiagnosticColor = windowLifeDebugMode >= 2u ? windowLife.debugColor : windowLifeDebugColor;
+		// Debug colours are shown as-is, not multiplied by the window texture.
+		diffuseColor *= 1.0f - windowLifeDebugWeight;
+		emitColor *= 1.0f - windowLifeDebugWeight;
+		windowLifeRoomLight *= 1.0f - windowLifeDebugWeight;
+		windowLifeDebugDirect = windowLifeDiagnosticColor * windowLifeDebugWeight;
 	}
 #	endif
 
@@ -3977,6 +4202,9 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 #	else
 	color.xyz += diffuseColor * material.BaseColor;
 #	endif
+#	if defined(WINDOW_LIFE_ACTIVE)
+	color.xyz += windowLifeRoomLight * material.BaseColor * windowLifeAlbedoFlatten + windowLifeDebugDirect;
+#	endif
 
 	color.xyz += indirectLobeWeights.diffuse * directionalAmbientColor;
 	color.xyz += transmissionColor;
@@ -4166,6 +4394,40 @@ FUR_EARLY_DEPTH_STENCIL PS_OUTPUT main(PS_INPUT input, bool frontFace : SV_IsFro
 #			endif
 	}
 #		endif
+#		if defined(WINDOW_LIFE_ACTIVE) && defined(DYNAMIC_CUBEMAPS)
+	// Restrained, explicitly directional probe layer at grazing angles so glass
+	// reflects the actual current environment rather than merely raising scalar F0.
+	[branch] if (windowLifeSurface.glassWeight > 1.0e-4f && WindowLife::GetFidelity0().x > 1.0e-4f)
+	{
+		float windowLifeGlassNoV = saturate(abs(dot(normalize(worldNormal), normalize(viewDirection))));
+		float windowLifeGlassFresnel = windowLifeSurface.f0 +
+									   (1.0f - windowLifeSurface.f0) * pow(1.0f - windowLifeGlassNoV, 5.0f);
+		float windowLifeProbeRoughness = max(material.Roughness * 0.72f, 0.06f);
+#			if defined(SKYLIGHTING)
+		float3 windowLifeGlassProbe = DynamicCubemaps::GetDynamicCubemapSpecularIrradiance(worldNormal, viewDirection, windowLifeProbeRoughness, skylightingSpecularSH, skylightingSpecularFadeOut);
+#			else
+		float3 windowLifeGlassProbe = DynamicCubemaps::GetDynamicCubemapSpecularIrradiance(worldNormal, viewDirection, windowLifeProbeRoughness);
+#			endif
+		color.xyz += windowLifeGlassProbe * windowLifeGlassFresnel *
+					 windowLifeSurface.glassWeight * WindowLife::GetFidelity0().x * 0.20f;
+	}
+#		endif
+
+#		if defined(WINDOW_LIFE_ACTIVE)
+	// Flat glass produces a tight solar glint distinct from the broad environment
+	// response. Exterior-only so directional light never leaks indoors.
+	[branch] if (!SharedData::InInterior && windowLifeSurface.glassWeight > 1.0e-4f &&
+				 WindowLife::GetFidelity0().w > 1.0e-4f)
+	{
+		float3 windowLifeSunL = normalize(SharedData::DirLightDirection.xyz);
+		float3 windowLifeSunR = reflect(-windowLifeSunL, normalize(worldNormal));
+		float windowLifeSunAlignment = saturate(dot(windowLifeSunR, normalize(viewDirection)));
+		float windowLifeSunGlint = pow(windowLifeSunAlignment, 192.0f) *
+								   windowLifeSurface.glassWeight * WindowLife::GetFidelity0().w;
+		color.xyz += max(SharedData::DirLightColor.xyz, 0.0f.xxx) * windowLifeSunGlint * 0.55f;
+	}
+#		endif
+
 #		if defined(CAPTURE_REFLECTION_RADIANCE)
 	radianceColor = Color::IrradianceToGamma(radianceLinearColor + (color.xyz - directLinearColor));
 #		endif

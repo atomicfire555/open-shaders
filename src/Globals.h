@@ -43,6 +43,7 @@ struct WaterEffects;
 struct SceneSelector;
 struct PerformanceOverlay;
 struct WetnessEffects;
+struct WindowLife;
 struct ExtendedTranslucency;
 struct Upscaling;
 class Profiler;
@@ -150,6 +151,7 @@ namespace globals
 		extern SceneSelector sceneSelector;
 		extern PerformanceOverlay performanceOverlay;
 		extern WetnessEffects wetnessEffects;
+		extern WindowLife windowLife;
 		extern ExtendedTranslucency extendedTranslucency;
 		extern Upscaling upscaling;
 		extern HDRDisplay hdrDisplay;

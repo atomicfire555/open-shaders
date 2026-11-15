@@ -1,0 +1,322 @@
+// Window Life - runtime interface and GPU data.
+// Ported to Community Shaders from PIXL Renderer (https://github.com/pixlmusic/PIXL-Renderer).
+// Copyright (C) 2026 PIXL Studio
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional permissions are described in the repository EXCEPTIONS.md.
+
+#pragma once
+
+#include "Buffer.h"
+#include "Feature.h"
+#include "I18n/I18n.h"
+
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+/**
+ * @brief Procedural inhabited-window and architectural-glass renderer.
+ *
+ * Phase 2A carries per-draw architectural-glass/window data through a tiny
+ * structured-buffer SRV rather than a constant-buffer register. This keeps the
+ * feature out of every constant-buffer register and leaves FeatureData b6 untouched.
+ */
+struct WindowLife : Feature
+{
+	virtual inline std::string GetName() override { return "Window Life"; }
+	virtual inline std::string GetDisplayName() override { return T("feature.window_life.name", "Window Life"); }
+	virtual inline std::string GetShortName() override { return "WindowLife"; }
+	virtual inline std::string_view GetShaderDefineName() override { return "WINDOW_LIFE"; }
+	virtual std::string_view GetCategory() const override { return FeatureCategories::kMaterials; }
+
+	virtual std::pair<std::string, std::vector<std::string>> GetFeatureSummary() override
+	{
+		return {
+			T("feature.window_life.description", "Upgrades architectural glass and adds subtle procedural life on both sides of suitable inhabited windows."),
+			{ T("feature.window_life.key_feature_1", "Old-glass Fresnel response, stable roughness/grime variation and restrained optical waviness"),
+				T("feature.window_life.key_feature_2", "Window classes keep silhouettes out of tiny, roof and awning panes"),
+				T("feature.window_life.key_feature_3", "Procedurally fitted, asynchronous occupants with varied articulated motion and depth parallax"),
+				T("feature.window_life.key_feature_4", "Window glass selectively suppresses parallax while retaining relief on frames and surrounding architecture") }
+		};
+	}
+
+	virtual inline bool HasShaderDefine(RE::BSShader::Type t) override
+	{
+		return t == RE::BSShader::Type::Lighting;
+	}
+
+	struct Settings
+	{
+		bool EnableWindowLife = true;
+		bool EnableArchitecturalGlass = true;
+
+		// Occupant transmission/occlusion. Day remains subtle; night is readable.
+		float DayShadowStrength = 0.02f;
+		float NightShadowStrength = 0.07f;
+		float DayActivity = 1.0f;
+		float EveningActivity = 1.0f;
+		float LateNightActivity = 1.0f;
+
+		// Interior optical illusion.
+		float ParallaxDepth = 35.8f;          // Exterior observer looking into rooms.
+		float InteriorParallaxDepth = 54.4f;  // Interior observer looking outdoors.
+		bool EnableOutdoorViews = true;
+		float OutdoorViewStrength = 1.24f;
+		float OutdoorViewEmission = 4.48f;
+		float Refraction = 2.06f;
+		float SilhouetteSoftness = 0.16f;
+		float HumanScale = 1.19f;
+		// Authored people are composited as a softly filtered colour layer. This
+		// is true opacity, independent of the legacy analytic-shadow fallback.
+		float OccupantOpacity = 0.25f;
+		float CurtainStrength = 1.0f;
+		float RoomDepthStrength = 0.27f;
+		bool EnableAuthoredRooms = true;
+		float AuthoredRoomStrength = 1.0f;
+		float InteriorContrast = 0.99f;
+		float InteriorEmission = 0.57f;
+		// Magnifies authored room art inside an automatically reconstructed
+		// aperture without changing the physical window bounds or room identity.
+		float InteriorScale = 2.0f;
+		// Additional atlas mip bias for authored rooms behind physical glass.
+		// Kept separate from silhouette filtering so room art can soften without
+		// weakening panes, mullions or occupant masks.
+		float InteriorSoftness = 0.52f;
+		// Exterior room volume uses the existing atlas and retains the accepted
+		// flat projector as a compatibility fallback.
+		float RoomVolumeStrength = 0.43f;
+		float WindowRecess = 8.0f;
+		// Texture-mod-safe geometry fitting owns only the room coordinate system.
+		// Optional exact masks may clip the final glass pixels but never resize,
+		// retile, seed or otherwise move the recessed interior.
+		bool AutomaticRoomSizing = true;
+		bool UseExactGlassMasks = false;
+		// Stable parent-aperture ownership: multiple glass meshes in a bounded
+		// window NiNode share one room, occupant timeline and projected backdrop.
+		bool GroupMultiPaneWindows = true;
+		// A mesh whose bounds exceed this multiple of the regional reference
+		// window is assumed to hold several windows. When the material has a
+		// glow map or an installed glass mask, each window is then fitted from
+		// that guide instead of sharing one room centred on the whole mesh.
+		// 2.75 restores the original single-window limit.
+		float MultiWindowMeshScale = 1.5f;
+		bool EnableInteriorPassers = true;
+
+		// Distance LOD and pane discrimination.
+		float DistanceFadeStart = 7162.0f;
+		float DistanceFadeEnd = 16000.0f;
+		float PaneThreshold = 0.15f;
+		float PaneSoftness = 0.15f;
+
+		// Stable procedural room grid and event cadence.
+		// Owner-validated fallback calibration. Preserve this path while the
+		// optional depth-reconstructed interior tier is developed separately.
+		float RoomWidth = 150.0f;
+		float RoomHeight = 150.0f;
+		float MotionSpeed = 1.93f;
+
+		// Phase 2A architectural glass.
+		float GlassStrength = 1.0f;
+		float GlassReflectionBoost = 1.1f;
+		float GlassRoughness = 0.06f;
+		float GlassTransmission = 1.0f;
+		float GlassDirtStrength = 0.09f;
+		float GlassDistortion = 0.057f;
+		float GlassNormalRetention = 0.24f;
+		// High-level fidelity controls. Defaults preserve the current response
+		// while enabling real probe reflection, weather coupling and restrained
+		// architectural variation without exposing implementation internals.
+		float EnvironmentReflectionStrength = 1.5f;
+		float InteriorLightingResponse = 1.0f;
+		float WeatherGlassResponse = 1.0f;
+		float SunGlintStrength = 0.24f;
+		float DirectionalRevealStrength = 0.22f;
+		float RoomVariationStrength = 0.12f;
+		float CloseLayerFeather = 0.65f;
+		bool SuppressWindowAutoPOM = true;
+
+		// First-stage physical eligibility guard. Geometry radius catches dedicated
+		// tiny window meshes; shader normal orientation catches roof/awning panes.
+		float MinShallowWindowRadius = 30.0f;
+		float MinFullWindowRadius = 75.0f;
+		float FullWindowVerticality = 0.9f;
+
+		bool DebugWindowDetection = false;
+		// Developer-only projection diagnostics. Zero retains the normal class
+		// overlay; the remaining values visualise the room-coordinate pipeline.
+		int DebugRoomProjection = 0;
+	} settings;
+
+	struct PerGeometryData
+	{
+		// c0: x enabled, y salt, z current shadow strength, w activity probability
+		float4 Runtime0{};
+		// c1: x parallax depth, y silhouette softness, z refraction units, w human scale
+		float4 Optics0{};
+		// c2: x fade start, y fade end, z pane threshold, w pane softness
+		float4 Surface0{};
+		// c3: x debug overlay, y room width, z room height, w motion speed
+		float4 Runtime1{};
+		// c4: x glass strength, y reflection boost, z target roughness, w transmission
+		float4 Glass0{};
+		// c5: x dirt, y distortion, z normal retention, w suppress pane parallax
+		float4 Glass1{};
+		// c6: x material tier [1..3], y glass evidence (2 diffuse, 1 other slot), z pane-source flags,
+		//     w explicit window evidence (2 diffuse name, 1 paired glow, 0 other)
+		float4 Class0{};
+		// c7: x min shallow radius, y min full radius, z full-window verticality, w architectural glass enabled
+		float4 Eligibility0{};
+		// c8: x curtain shadow, y recessed-room shadow, z automatic procedural sizing, w interior passers
+		float4 Interior0{};
+		// c9: xyz absolute geometry-bound centre, w geometry radius
+		float4 Geometry0{};
+		// c10: x regional room family, y atlas ready/enabled, z authored-room blend,
+		//      w geometry layout hint (-1 facade, 0 unknown, 1 dedicated aperture)
+		float4 Asset0{};
+		// c11: x authored-room contrast, y exterior-room or interior-outdoor emission,
+		//      z authored-occupant opacity, w automatic room-art scale
+		float4 Presentation0{};
+		// c12: x stable per-instance salt, y cached material layout policy,
+		//      z day/night blend, w active snow-weather state
+		float4 Layout0{};
+		// c13: x environment reflection, y interior lighting response,
+		//      z weathered glass response, w sun glint strength
+		float4 Fidelity0{};
+		// c14: x directional reveal, y per-room variation,
+		//      z close cutout feather, w outdoor atlas selected (interior view)
+		float4 Fidelity1{};
+		// c15: x authored-room softness, y room-box blend,
+		//      z glass-to-room recess (Skyrim units), w grouped-parent flag.
+		// Reuses the spare lane without changing the 256-byte GPU ABI.
+		float4 Presentation1{};
+	};
+	static_assert(sizeof(PerGeometryData) == 256, "WindowLife per-draw payload must be exactly 256 bytes.");
+	static_assert(sizeof(PerGeometryData) % 16 == 0, "WindowLife constant-buffer payload must remain 16-byte sized.");
+
+	virtual void DrawSettings() override;
+	virtual void LoadSettings(json& o_json) override;
+	virtual void SaveSettings(json& o_json) override;
+	virtual void RestoreDefaultSettings() override;
+	virtual void SetupResources() override;
+	virtual void PostPostLoad() override;
+
+	void BSLightingShader_SetupGeometry(RE::BSRenderPass* a_pass);
+
+private:
+	struct Classification
+	{
+		bool isWindow = false;
+		bool hasGlowTexture = false;
+		bool hasAuthoredMask = false;
+		bool explicitWindow = false;
+		bool diffuseNamedWindow = false;
+		bool namedGlass = false;
+		bool diffuseNamedGlass = false;
+		int materialTier = 0;  // 1 glass only, 2 shallow interior, 3 full candidate
+		int roomFamily = 0;    // 0 Nordic, 1 noble, 2 Riften, 3 Windhelm, 4 Dwemer, 5 trade
+		int score = 0;
+		std::uint32_t materialIdentity = 0;
+		std::string authoredMaskKey;
+		std::string evidence;
+	};
+
+	Classification ClassifyMaterial(const RE::BSLightingShaderMaterialBase* a_material);
+	const Classification& GetClassification(const RE::BSLightingShaderMaterialBase* a_material);
+	void RefreshFrameBaseData();
+	void UpdateAndBindActive(const Classification& a_classification, const RE::BSGeometry* a_geometry);
+	bool UploadData(ID3D11Buffer* a_buffer, const PerGeometryData& a_data) const;
+	void BindNeutral() const;
+	void BindActive(const Classification& a_classification) const;
+	struct AuthoredMask
+	{
+		winrt::com_ptr<ID3D11ShaderResourceView> mask;
+		winrt::com_ptr<ID3D11ShaderResourceView> paneBounds;  // pane rectangles, may be null
+	};
+	const AuthoredMask* GetAuthoredMask(const Classification& a_classification) const;
+	static float GetDayNightBlend(float a_hour);
+	static float GetActivityForHour(float a_hour, const Settings& a_settings);
+
+	// Open Shaders already uses PS t100-t127 (shadow atlases, wind fields, fur shells,
+	// LOD shadows, deferred masks), so WindowLife takes two free runs instead:
+	// t46-t49 for its textures and t56-t58 for the room atlas, per-draw buffer
+	// and the glass-mask pane lookup.
+	static constexpr UINT kGlassGrimeSRVSlot = 46;
+	static constexpr UINT kOccupantAtlasSRVSlot = 47;
+	static constexpr UINT kCurtainAtlasSRVSlot = 48;
+	static constexpr UINT kAuthoredMaskSRVSlot = 49;
+	static constexpr UINT kRoomAtlasSRVSlot = 56;
+	static constexpr UINT kPerDrawSRVSlot = 57;
+	static constexpr UINT kPaneBoundsSRVSlot = 58;
+
+	winrt::com_ptr<ID3D11Buffer> activeBuffer;
+	winrt::com_ptr<ID3D11Buffer> neutralBuffer;
+	winrt::com_ptr<ID3D11ShaderResourceView> activeSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> neutralSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> glassGrimeSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> occupantAtlasSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> curtainAtlasSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> roomAtlasSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> outdoorAtlasSRV;
+	winrt::com_ptr<ID3D11ShaderResourceView> outdoorNightAtlasSRV;
+	PerGeometryData frameBaseData{};
+	PerGeometryData currentActiveData{};
+	bool activeDataValid = false;
+	std::uint32_t activeDataFrame = ~0u;
+	mutable bool uploadFailureLogged = false;
+	bool invalidGeometryLogged = false;
+
+	// Developer diagnostics: confirm the geometry hook is reached and show why
+	// materials are or are not classified. Reported to the log every few
+	// seconds while "Show Window Class Overlay" is on.
+	struct Diagnostics
+	{
+		std::uint64_t hookCalls = 0;
+		std::uint64_t noMaterial = 0;
+		std::uint64_t disabled = 0;
+		std::uint64_t invalidGeometry = 0;
+		std::uint64_t notWindow = 0;
+		std::uint64_t windowDraws = 0;
+		std::uint64_t newMaterials = 0;
+		std::uint64_t noTextureSet = 0;
+		std::uint64_t noTexturePaths = 0;
+		std::uint32_t classifyLines = 0;
+		std::uint32_t geometryLines = 0;
+		std::unordered_set<const RE::BSGeometry*> loggedGeometry;
+		bool firstDrawLogged = false;
+		std::chrono::steady_clock::time_point lastReport{};
+	} diag;
+	static constexpr std::uint32_t kMaxClassifyLogLines = 600;
+	static constexpr std::uint32_t kMaxGeometryLogLines = 250;
+	void ReportDiagnostics();
+	// Reused by the render-thread geometry hook to avoid allocating a lower-
+	// case NIF name for every detected window draw.
+	std::string geometryNameScratch{};
+
+	std::unordered_map<std::string, AuthoredMask> authoredMaskSRVs;
+	std::unordered_map<std::uintptr_t, Classification> classificationCache;
+
+	struct Hooks
+	{
+		struct BSLightingShader_SetupGeometry
+		{
+			static void thunk(RE::BSShader* a_this, RE::BSRenderPass* a_pass, std::uint32_t a_renderFlags);
+			static inline REL::Relocation<decltype(thunk)> func;
+		};
+
+		static void Install()
+		{
+			stl::write_vfunc<0x6, BSLightingShader_SetupGeometry>(RE::VTABLE_BSLightingShader[0]);
+			logger::info(
+				"[WindowLife] Installed BSLightingShader geometry hook on PS t{} filtered grime + t{} occupant atlas + t{} curtain atlas + t{} optional exact glass mask + t{} room atlas + t{} 256-byte structured SRV + t{} glass-mask pane lookup.",
+				kGlassGrimeSRVSlot,
+				kOccupantAtlasSRVSlot,
+				kCurtainAtlasSRVSlot,
+				kAuthoredMaskSRVSlot,
+				kRoomAtlasSRVSlot,
+				kPerDrawSRVSlot,
+				kPaneBoundsSRVSlot);
+		}
+	};
+};

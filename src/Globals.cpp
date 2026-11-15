@@ -59,6 +59,7 @@
 #include "Features/VolumetricShadows.h"
 #include "Features/WaterEffects.h"
 #include "Features/WetnessEffects.h"
+#include "Features/WindowLife.h"
 #include "Features/Wind/Wind.h"
 #include "Menu.h"
 #include "ShaderCache.h"
@@ -114,6 +115,7 @@ namespace globals
 		SceneSelector sceneSelector{};
 		PerformanceOverlay performanceOverlay{};
 		WetnessEffects wetnessEffects{};
+		WindowLife windowLife{};
 		ExtendedTranslucency extendedTranslucency{};
 		Upscaling upscaling{};
 		HDRDisplay hdrDisplay{};
